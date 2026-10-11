@@ -1,0 +1,137 @@
+LOAD CSV WITH HEADERS FROM 'file:///events.csv' AS row
+RETURN row
+LIMIT 5;
+
+CREATE CONSTRAINT user_visitorid IF NOT EXISTS
+FOR (u:User) REQUIRE u.visitorid IS UNIQUE;
+
+CREATE CONSTRAINT item_itemid IF NOT EXISTS
+FOR (i:Item) REQUIRE i.itemid IS UNIQUE;
+
+:auto LOAD CSV WITH HEADERS
+FROM 'file:///events.csv' AS row
+CALL (row) {
+    WITH row
+    WHERE row.visitorid IS NOT NULL
+      AND row.itemid IS NOT NULL
+
+    MERGE (u:User {visitorid: row.visitorid})
+    MERGE (i:Item {itemid: row.itemid})
+    MERGE (u)-[r:INTERACTED_WITH {event: row.event}]->(i)
+    SET r.timestamp = row.timestamp,
+        r.transactionid = row.transactionid
+} IN TRANSACTIONS OF 10000 ROWS;
+
+:auto LOAD CSV WITH HEADERS
+FROM 'file:///events.csv' AS row
+CALL (row) {
+    WITH row
+    WHERE row.visitorid IS NOT NULL
+      AND row.itemid IS NOT NULL
+      AND row.event IN ['view', 'addtocart', 'transaction']
+
+    MATCH (u:User {visitorid: row.visitorid})
+    MATCH (i:Item {itemid: row.itemid})
+
+    MERGE (u)-[r:EVENT_COUNT {event: row.event}]->(i)
+    ON CREATE SET r.count = 1
+    ON MATCH SET r.count = r.count + 1
+} IN TRANSACTIONS OF 10000 ROWS;
+
+:auto MATCH (u:User)-[r:EVENT_COUNT]->(i:Item)
+WITH u, i,
+     sum(
+         r.count *
+         CASE r.event
+             WHEN 'view' THEN 1
+             WHEN 'addtocart' THEN 2
+             WHEN 'transaction' THEN 3
+             ELSE 0
+         END
+     ) AS score
+CALL (u, i, score) {
+    MERGE (u)-[rating:RATED]->(i)
+    SET rating.score = score
+} IN TRANSACTIONS OF 10000 ROWS;
+
+:auto MATCH (u:User)-[r1:RATED]->(i1:Item)
+MATCH (u)-[r2:RATED]->(i2:Item)
+WHERE elementId(i1) < elementId(i2)
+WITH i1, i2,
+     collect([r1.score, r2.score]) AS pairs
+WHERE size(pairs) >= 3
+WITH i1, i2, pairs,
+     [p IN pairs | p[0]] AS xs,
+     [p IN pairs | p[1]] AS ys
+WITH i1, i2, pairs, xs, ys,
+     reduce(s = 0.0, x IN xs | s + x) / size(xs) AS meanX,
+     reduce(s = 0.0, y IN ys | s + y) / size(ys) AS meanY
+WITH i1, i2, pairs, xs, ys, meanX, meanY,
+     reduce(s = 0.0, p IN pairs |
+       s + (p[0] - meanX) * (p[1] - meanY)) AS numerator,
+     sqrt(reduce(s = 0.0, x IN xs |
+       s + (x - meanX) * (x - meanX))) AS denominatorX,
+     sqrt(reduce(s = 0.0, y IN ys |
+       s + (y - meanY) * (y - meanY))) AS denominatorY
+WITH i1, i2,
+     CASE
+       WHEN denominatorX * denominatorY = 0 THEN null
+       ELSE numerator / (denominatorX * denominatorY)
+     END AS pearsonScore
+WHERE pearsonScore IS NOT NULL
+  AND pearsonScore > 0
+CALL (i1, i2, pearsonScore) {
+    MERGE (i1)-[p:PEARSON_SIMILAR_TO]-(i2)
+    SET p.score = pearsonScore
+} IN TRANSACTIONS OF 5000 ROWS;
+
+:auto MATCH (i1:Item)<-[:INTERACTED_WITH]-(u:User)-[:INTERACTED_WITH]->(i2:Item)
+WHERE elementId(i1) < elementId(i2)
+WITH i1, i2, count(DISTINCT u) AS intersection
+WHERE intersection >= 2
+MATCH (i1)<-[:INTERACTED_WITH]-(u1:User)
+WITH i1, i2, intersection, count(DISTINCT u1) AS set1
+MATCH (i2)<-[:INTERACTED_WITH]-(u2:User)
+WITH i1, i2, intersection, set1, count(DISTINCT u2) AS set2
+WITH i1, i2,
+     1.0 * intersection / (set1 + set2 - intersection) AS jaccardScore
+WHERE jaccardScore > 0.05
+CALL (i1, i2, jaccardScore) {
+    MERGE (i1)-[s:SIMILAR_TO]-(i2)
+    SET s.score = jaccardScore
+} IN TRANSACTIONS OF 5000 ROWS;
+
+MATCH (u:User {visitorid: '994227'})
+MATCH (u)-[:INTERACTED_WITH]->(i:Item)
+      -[s:SIMILAR_TO]-(rec:Item)
+WHERE NOT EXISTS {
+    MATCH (u)-[:INTERACTED_WITH]->(rec)
+}
+WITH rec, sum(s.score) AS JaccardScore
+RETURN rec.itemid AS RecommendedItem,
+       JaccardScore
+ORDER BY JaccardScore DESC
+LIMIT 5;
+
+MATCH (u:User {visitorid: '994227'})
+MATCH (u)-[:INTERACTED_WITH]->(i:Item)
+      -[p:PEARSON_SIMILAR_TO]-(rec:Item)
+WHERE NOT EXISTS {
+    MATCH (u)-[:INTERACTED_WITH]->(rec)
+}
+WITH rec, sum(p.score) AS PearsonScore
+RETURN rec.itemid AS RecommendedItem,
+       PearsonScore
+ORDER BY PearsonScore DESC
+LIMIT 5;
+
+MATCH p = (u:User)-[:INTERACTED_WITH]->(i:Item)
+WHERE u.visitorid = '179437'
+RETURN p;
+
+MATCH p = (u:User)-[:INTERACTED_WITH]->(i:Item)
+          -[:PEARSON_SIMILAR_TO]-(rec:Item)
+WHERE u.visitorid = '179437'
+RETURN p;
+
+MATCH p=()-[]->() RETURN p LIMIT 25;
